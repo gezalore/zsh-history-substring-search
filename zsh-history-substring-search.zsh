@@ -51,6 +51,8 @@ typeset -g HISTORY_SUBSTRING_SEARCH_FUZZY=''
 typeset -g HISTORY_SUBSTRING_SEARCH_MENU=''
 typeset -g HISTORY_SUBSTRING_SEARCH_MENU_SELECTED='standout'
 typeset -g HISTORY_SUBSTRING_SEARCH_MENU_SIZE=16
+typeset -g HISTORY_SUBSTRING_SEARCH_MENU_DIFF_INSERT='fg=green,bold,standout'
+typeset -g HISTORY_SUBSTRING_SEARCH_MENU_DIFF_DELETE='fg=red,bold'
 
 #-----------------------------------------------------------------------------
 # declare internal global variables
@@ -365,6 +367,8 @@ _history-substring-search-display-menu() {
   local index   # History index of currently drawn menu item
   local offset  # Offset from the selected history entry
   local base    # Character offset of current menu item in POSTDISPLAY
+  local diffops # The diff operations between the selected and previous result
+  local op b e  # Operation, begin, end temporaries
   local curr_history_entry
   local prev_history_entry
 
@@ -390,6 +394,38 @@ $curr_history_entry"
     # If this is the selected line, highlight the entire menu item
     if [[ $offset -eq 0 ]]; then
       region_highlight+=("$base $(($#BUFFER + $#POSTDISPLAY)) $HISTORY_SUBSTRING_SEARCH_MENU_SELECTED")
+    fi
+
+    # If we are beyond the end of history in either directions, or
+    # _history_substring_search_match_index == 1 (meaning there is no
+    # previous result), then do not highlight the diff.
+    if [[ $_history_substring_search_match_index -lt 2 || $_history_substring_search_match_index -gt $#_history_substring_search_matches ]]; then
+      continue
+    fi
+
+    # If we are drawing the selected result, compute the diff ops
+    if [[ $offset -eq 0 ]]; then
+      # The history entry 1 older than the selected entry
+      _history-substring-search-diff-ops diffops $(($index - 1)) $index
+      diffops=(${(s/ /)diffops})
+    fi
+
+    # Highlight the diff in the selected line
+    if [[ $offset -eq 0 ]]; then
+      for op b e in $diffops; do
+        if [[ $op == "insert" ]]; then
+          region_highlight+=("$(($base + $b)) $(($base + $e)) $HISTORY_SUBSTRING_SEARCH_MENU_DIFF_INSERT")
+        fi
+      done
+    fi
+
+    # Highlight the diff in the preceding line
+    if [[ $offset -eq -1 ]]; then
+      for op b e in $diffops; do
+        if [[ $op == "delete" ]]; then
+          region_highlight+=("$(($base + $b)) $(($base + $e)) $HISTORY_SUBSTRING_SEARCH_MENU_DIFF_DELETE")
+        fi
+      done
     fi
   done
 }
@@ -551,6 +587,112 @@ _history-substring-search-compute-formatted-result() {
     echo -E "$padded_line"
 
   done
+}
+
+_history-substring-search-diff-ops() {
+  #
+  # Get the diff operations (insertions/deletions between the given menu
+  # items. We cache the result for performance.
+  #
+
+  # $1 is the name of the result parameter
+  local _resultvar=$1; shift
+
+  local key="diff-ops-${1}-${2}"
+  local result=${_history_substring_search_cache[$key]}
+  if [[ -z $result ]]; then
+    #
+    # We do not have a cached result. Compute the result, and cache it.
+    #
+    local entry_a entry_b
+    _history-substring-search-formatted-result entry_a $1
+    _history-substring-search-formatted-result entry_b $2
+    result=$(_history-substring-search-compute-diff-ops $entry_a $entry_b)
+    _history_substring_search_cache[$key]=$result
+  fi
+
+  eval "$_resultvar=\$result"
+}
+
+_history-substring-search-compute-diff-ops() {
+python2 - "$1" "$2" <<EOP
+from sys import argv
+from difflib import SequenceMatcher
+
+a, b = argv[1], argv[2]
+
+def split_strip_merge(s):
+    rawlines = []
+    loc = []
+    b = 0
+    for lineno, line in enumerate(s.splitlines(True)):
+        l = len(line)
+        loc.extend(zip(range(b, b + l), [lineno] * l))
+
+        line = line.rstrip()
+        r = len(line)
+
+        # Mark any trailing whitespace as removed
+        loc[b + r:b + l] = [None] * (l - r)
+
+        # If the trimmed line ends in '\', the '\' will also be removed
+        if line.endswith('\\\\'):
+            loc[b + r - 1] = None
+
+        rawlines.append(line)
+        b += l
+
+
+    loc = [_ for _ in loc if _ is not None]
+
+    # Append an extra item so the index after the end is still valid
+    # make it point 1 past the end
+    loc.append((loc[-1][0] + 1, loc[-1][1]))
+
+    # Merge lines ending in '\'
+    lines = [rawlines[0]]
+    for line in rawlines[1:]:
+        if lines[-1].endswith('\\\\'):
+            lines[-1] = lines[-1][:-1] + line
+        else:
+            lines.append(line)
+
+    return lines, loc
+
+lines_a, loc_a = split_strip_merge(a)
+lines_b, loc_b = split_strip_merge(b)
+
+line_a = "".join(lines_a)
+line_b = "".join(lines_b)
+
+assert len(line_a) + 1 == len(loc_a)
+assert len(line_b) + 1 == len(loc_b)
+
+def emit(op, b, e, loc):
+    while loc[b][1] != loc[e][1]:
+        for E in range(b, e):
+            if loc[E + 1][1] != loc[b][1]:
+                print op, loc[b][0], loc[E][0] + 1,
+                b = E + 1
+                break
+    print op, loc[b][0], loc[e][0],
+
+# Comptue the diff operatoions
+for op, ba, ea, bb, eb in  SequenceMatcher(a=line_a, b=line_b).get_opcodes():
+
+    # Substitute 'replace' ops with the constituent delete and insert ops
+
+    if op == 'replace':
+        emit('delete', ba, ea, loc_a)
+        emit('insert', bb, eb, loc_b)
+    elif op == 'delete':
+        emit('delete', ba, ea, loc_a)
+    elif op == 'insert':
+        emit('insert', bb, eb, loc_b)
+
+# Print trailing newline
+print
+EOP
 }
 
 _history-substring-search-up-buffer() {
